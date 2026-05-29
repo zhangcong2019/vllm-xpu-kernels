@@ -330,7 +330,10 @@ void call_fused_add_rms_norm_kernel(
 //   1. weight is loaded as (weight + 1.0) in fp32, applied to the normalized
 //      value still in fp32 (the (1 + w) factor is the Gemma convention).
 //   2. variance is accumulated in fp32 (already true upstream, kept here).
-template <typename scalar_t>
+// Fast path mirrors vllm::rms_norm_kernel: a vec4_t<scalar_t> wide load/store
+// when input/output/weight are all VEC_SIZE-aligned and hidden_size is a
+// multiple of VEC_SIZE; otherwise a scalar fallback runs the whole row.
+template <typename scalar_t, int VEC_SIZE = 4>
 class gemma_rms_norm_kernel {
  public:
   gemma_rms_norm_kernel(
@@ -359,10 +362,35 @@ class gemma_rms_norm_kernel {
     const scalar_t* input_row = input + row * input_stride;
     scalar_t* out_row = out + row * hidden_size;
 
-    for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
-         idx += item_ct1.get_local_range(2)) {
-      float x = static_cast<float>(input_row[idx]);
-      variance += x * x;
+    constexpr int WIDTH = VEC_SIZE * sizeof(scalar_t);
+    uintptr_t addr_in = reinterpret_cast<uintptr_t>(input_row);
+    uintptr_t addr_w = reinterpret_cast<uintptr_t>(weight);
+    uintptr_t addr_out = reinterpret_cast<uintptr_t>(out_row);
+    bool can_vec = ((addr_in & (WIDTH - 1)) == 0) &&
+                   ((addr_w & (WIDTH - 1)) == 0) &&
+                   ((addr_out & (WIDTH - 1)) == 0) &&
+                   ((hidden_size & (VEC_SIZE - 1)) == 0);
+
+    // ---- pass 1: variance ----
+    if (can_vec) {
+      auto const* v_in =
+          reinterpret_cast<const vec4_t<scalar_t>*>(input_row);
+      int64_t const num_vec = hidden_size / VEC_SIZE;
+      for (int i = item_ct1.get_local_id(2); i < num_vec;
+           i += item_ct1.get_local_range(2)) {
+        vec4_t<scalar_t> tmp = v_in[i];
+#pragma unroll
+        for (int j = 0; j < VEC_SIZE; ++j) {
+          float x = static_cast<float>(tmp.val[j]);
+          variance += x * x;
+        }
+      }
+    } else {
+      for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
+           idx += item_ct1.get_local_range(2)) {
+        float x = static_cast<float>(input_row[idx]);
+        variance += x * x;
+      }
     }
 
     variance = sycl::reduce_over_group(
@@ -376,11 +404,33 @@ class gemma_rms_norm_kernel {
     item_ct1.barrier(sycl::access::fence_space::local_space);
     const float rrms = *s_variance_ptr;
 
-    for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
-         idx += item_ct1.get_local_range(2)) {
-      float x = static_cast<float>(input_row[idx]);
-      float w = static_cast<float>(weight[idx]) + 1.0f;
-      out_row[idx] = static_cast<scalar_t>(x * rrms * w);
+    // ---- pass 2: output = x * rrms * (1 + w) ----
+    if (can_vec) {
+      auto const* v_in =
+          reinterpret_cast<const vec4_t<scalar_t>*>(input_row);
+      auto const* v_w = reinterpret_cast<const vec4_t<scalar_t>*>(weight);
+      auto* v_out = reinterpret_cast<vec4_t<scalar_t>*>(out_row);
+      int64_t const num_vec = hidden_size / VEC_SIZE;
+      for (int i = item_ct1.get_local_id(2); i < num_vec;
+           i += item_ct1.get_local_range(2)) {
+        vec4_t<scalar_t> in_v = v_in[i];
+        vec4_t<scalar_t> w_v = v_w[i];
+        vec4_t<scalar_t> dst;
+#pragma unroll
+        for (int j = 0; j < VEC_SIZE; ++j) {
+          float x = static_cast<float>(in_v.val[j]);
+          float w = static_cast<float>(w_v.val[j]) + 1.0f;
+          dst.val[j] = static_cast<scalar_t>(x * rrms * w);
+        }
+        v_out[i] = dst;
+      }
+    } else {
+      for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
+           idx += item_ct1.get_local_range(2)) {
+        float x = static_cast<float>(input_row[idx]);
+        float w = static_cast<float>(weight[idx]) + 1.0f;
+        out_row[idx] = static_cast<scalar_t>(x * rrms * w);
+      }
     }
   }
 
@@ -428,7 +478,9 @@ void call_gemma_rms_norm_kernel(
 // Gemma variant of fused add + RMSNorm. In-place semantics:
 //   residual <- input + residual   (the unnormalized sum)
 //   input    <- normalize(residual) * (1 + weight)   (in fp32, then cast)
-template <typename scalar_t>
+// Fast path uses vec4_t loads/stores when all four pointers and hidden_size
+// are VEC_SIZE-aligned; otherwise scalar fallback.
+template <typename scalar_t, int VEC_SIZE = 4>
 class gemma_fused_add_rms_norm_kernel {
  public:
   gemma_fused_add_rms_norm_kernel(
@@ -457,12 +509,42 @@ class gemma_fused_add_rms_norm_kernel {
     scalar_t* input_row = input + row * input_stride;
     scalar_t* residual_row = residual + row * hidden_size;
 
-    for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
-         idx += item_ct1.get_local_range(2)) {
-      float xs = static_cast<float>(input_row[idx]) +
-                 static_cast<float>(residual_row[idx]);
-      variance += xs * xs;
-      residual_row[idx] = static_cast<scalar_t>(xs);
+    constexpr int WIDTH = VEC_SIZE * sizeof(scalar_t);
+    uintptr_t addr_in = reinterpret_cast<uintptr_t>(input_row);
+    uintptr_t addr_res = reinterpret_cast<uintptr_t>(residual_row);
+    uintptr_t addr_w = reinterpret_cast<uintptr_t>(weight);
+    bool can_vec = ((addr_in & (WIDTH - 1)) == 0) &&
+                   ((addr_res & (WIDTH - 1)) == 0) &&
+                   ((addr_w & (WIDTH - 1)) == 0) &&
+                   ((hidden_size & (VEC_SIZE - 1)) == 0);
+
+    // ---- pass 1: residual = input + residual; accumulate variance ----
+    if (can_vec) {
+      auto* v_in = reinterpret_cast<vec4_t<scalar_t>*>(input_row);
+      auto* v_res = reinterpret_cast<vec4_t<scalar_t>*>(residual_row);
+      int64_t const num_vec = hidden_size / VEC_SIZE;
+      for (int i = item_ct1.get_local_id(2); i < num_vec;
+           i += item_ct1.get_local_range(2)) {
+        vec4_t<scalar_t> in_v = v_in[i];
+        vec4_t<scalar_t> res_v = v_res[i];
+        vec4_t<scalar_t> sum_v;
+#pragma unroll
+        for (int j = 0; j < VEC_SIZE; ++j) {
+          float xs = static_cast<float>(in_v.val[j]) +
+                     static_cast<float>(res_v.val[j]);
+          variance += xs * xs;
+          sum_v.val[j] = static_cast<scalar_t>(xs);
+        }
+        v_res[i] = sum_v;
+      }
+    } else {
+      for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
+           idx += item_ct1.get_local_range(2)) {
+        float xs = static_cast<float>(input_row[idx]) +
+                   static_cast<float>(residual_row[idx]);
+        variance += xs * xs;
+        residual_row[idx] = static_cast<scalar_t>(xs);
+      }
     }
 
     variance = sycl::reduce_over_group(
@@ -476,11 +558,33 @@ class gemma_fused_add_rms_norm_kernel {
     item_ct1.barrier(sycl::access::fence_space::local_space);
     const float rrms = *s_variance_ptr;
 
-    for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
-         idx += item_ct1.get_local_range(2)) {
-      float xs = static_cast<float>(residual_row[idx]);
-      float w = static_cast<float>(weight[idx]) + 1.0f;
-      input_row[idx] = static_cast<scalar_t>(xs * rrms * w);
+    // ---- pass 2: input = norm(residual) * (1 + w) ----
+    if (can_vec) {
+      auto const* v_res =
+          reinterpret_cast<const vec4_t<scalar_t>*>(residual_row);
+      auto const* v_w = reinterpret_cast<const vec4_t<scalar_t>*>(weight);
+      auto* v_in = reinterpret_cast<vec4_t<scalar_t>*>(input_row);
+      int64_t const num_vec = hidden_size / VEC_SIZE;
+      for (int i = item_ct1.get_local_id(2); i < num_vec;
+           i += item_ct1.get_local_range(2)) {
+        vec4_t<scalar_t> res_v = v_res[i];
+        vec4_t<scalar_t> w_v = v_w[i];
+        vec4_t<scalar_t> dst;
+#pragma unroll
+        for (int j = 0; j < VEC_SIZE; ++j) {
+          float xs = static_cast<float>(res_v.val[j]);
+          float w = static_cast<float>(w_v.val[j]) + 1.0f;
+          dst.val[j] = static_cast<scalar_t>(xs * rrms * w);
+        }
+        v_in[i] = dst;
+      }
+    } else {
+      for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
+           idx += item_ct1.get_local_range(2)) {
+        float xs = static_cast<float>(residual_row[idx]);
+        float w = static_cast<float>(weight[idx]) + 1.0f;
+        input_row[idx] = static_cast<scalar_t>(xs * rrms * w);
+      }
     }
   }
 
