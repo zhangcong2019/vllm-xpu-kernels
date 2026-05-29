@@ -333,7 +333,12 @@ void call_fused_add_rms_norm_kernel(
 // Fast path mirrors vllm::rms_norm_kernel: a vec4_t<scalar_t> wide load/store
 // when input/output/weight are all VEC_SIZE-aligned and hidden_size is a
 // multiple of VEC_SIZE; otherwise a scalar fallback runs the whole row.
-template <typename scalar_t, int VEC_SIZE = 4>
+//
+// USE_SLM=true variant additionally caches the fp32 input in shared local
+// memory during pass 1, so pass 2 reads from SLM instead of re-fetching from
+// HBM. Host launcher gates this on `hidden_size * sizeof(float)` <= SLM
+// budget; otherwise USE_SLM=false runs and we re-read from HBM.
+template <typename scalar_t, int VEC_SIZE = 4, bool USE_SLM = false>
 class gemma_rms_norm_kernel {
  public:
   gemma_rms_norm_kernel(
@@ -343,19 +348,23 @@ class gemma_rms_norm_kernel {
       const scalar_t* __restrict__ weight_,  // [hidden_size]
       const float epsilon_,
       const int hidden_size_,
-      sycl::local_accessor<float, 1> s_variance_)
+      sycl::local_accessor<float, 1> s_variance_,
+      sycl::local_accessor<float, 1> s_input_)
       : out(out_),
         input(input_),
         input_stride(input_stride_),
         weight(weight_),
         epsilon(epsilon_),
         hidden_size(hidden_size_),
-        s_variance(s_variance_) {}
+        s_variance(s_variance_),
+        s_input(s_input_) {}
 
   void operator() [[sycl::reqd_sub_group_size(32)]] (
       const sycl::nd_item<3>& item_ct1) const {
     float* s_variance_ptr =
         s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
+    float* s_input_ptr =
+        s_input.template get_multi_ptr<sycl::access::decorated::no>().get();
     float variance = 0.0f;
 
     const int row = item_ct1.get_group(2);
@@ -371,7 +380,7 @@ class gemma_rms_norm_kernel {
                    ((addr_out & (WIDTH - 1)) == 0) &&
                    ((hidden_size & (VEC_SIZE - 1)) == 0);
 
-    // ---- pass 1: variance ----
+    // ---- pass 1: variance (and optionally cache fp32 input to SLM) ----
     if (can_vec) {
       auto const* v_in =
           reinterpret_cast<const vec4_t<scalar_t>*>(input_row);
@@ -383,6 +392,9 @@ class gemma_rms_norm_kernel {
         for (int j = 0; j < VEC_SIZE; ++j) {
           float x = static_cast<float>(tmp.val[j]);
           variance += x * x;
+          if constexpr (USE_SLM) {
+            s_input_ptr[i * VEC_SIZE + j] = x;
+          }
         }
       }
     } else {
@@ -390,6 +402,9 @@ class gemma_rms_norm_kernel {
            idx += item_ct1.get_local_range(2)) {
         float x = static_cast<float>(input_row[idx]);
         variance += x * x;
+        if constexpr (USE_SLM) {
+          s_input_ptr[idx] = x;
+        }
       }
     }
 
@@ -413,21 +428,35 @@ class gemma_rms_norm_kernel {
       int64_t const num_vec = hidden_size / VEC_SIZE;
       for (int i = item_ct1.get_local_id(2); i < num_vec;
            i += item_ct1.get_local_range(2)) {
-        vec4_t<scalar_t> in_v = v_in[i];
         vec4_t<scalar_t> w_v = v_w[i];
         vec4_t<scalar_t> dst;
+        if constexpr (USE_SLM) {
 #pragma unroll
-        for (int j = 0; j < VEC_SIZE; ++j) {
-          float x = static_cast<float>(in_v.val[j]);
-          float w = static_cast<float>(w_v.val[j]) + 1.0f;
-          dst.val[j] = static_cast<scalar_t>(x * rrms * w);
+          for (int j = 0; j < VEC_SIZE; ++j) {
+            float x = s_input_ptr[i * VEC_SIZE + j];
+            float w = static_cast<float>(w_v.val[j]) + 1.0f;
+            dst.val[j] = static_cast<scalar_t>(x * rrms * w);
+          }
+        } else {
+          vec4_t<scalar_t> in_v = v_in[i];
+#pragma unroll
+          for (int j = 0; j < VEC_SIZE; ++j) {
+            float x = static_cast<float>(in_v.val[j]);
+            float w = static_cast<float>(w_v.val[j]) + 1.0f;
+            dst.val[j] = static_cast<scalar_t>(x * rrms * w);
+          }
         }
         v_out[i] = dst;
       }
     } else {
       for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
            idx += item_ct1.get_local_range(2)) {
-        float x = static_cast<float>(input_row[idx]);
+        float x;
+        if constexpr (USE_SLM) {
+          x = s_input_ptr[idx];
+        } else {
+          x = static_cast<float>(input_row[idx]);
+        }
         float w = static_cast<float>(weight[idx]) + 1.0f;
         out_row[idx] = static_cast<scalar_t>(x * rrms * w);
       }
@@ -442,7 +471,14 @@ class gemma_rms_norm_kernel {
   const float epsilon;
   const int hidden_size;
   sycl::local_accessor<float, 1> s_variance;
+  sycl::local_accessor<float, 1> s_input;  // size 0 if USE_SLM=false
 };
+
+// Cache the fp32 input row in SLM when it fits in this budget. 32 KB allows
+// hidden_size up to 8192, covering Gemma/Qwen3.5/Llama-class models without
+// hurting occupancy (Intel XPU work-groups have 128 KB SLM, 32 KB leaves
+// plenty of room for multiple concurrent groups per Xe-core).
+constexpr int GEMMA_RMS_SLM_BUDGET_BYTES = 32 * 1024;
 
 template <typename scalar_t>
 void call_gemma_rms_norm_kernel(
@@ -460,19 +496,44 @@ void call_gemma_rms_norm_kernel(
   sycl::range<3> grid(1, 1, num_tokens);
   sycl::range<3> block(1, 1, std::min(hidden_size, 1024));
   auto& queue = vllm::xpu::vllmGetQueue();
-  queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> s_variance(sycl::range<1>(1), cgh);
-    cgh.parallel_for(
-        sycl::nd_range<3>(grid * block, block),
-        gemma_rms_norm_kernel<sycl_t>(
-            (sycl_t*)out_ptr,
-            (const sycl_t*)input_ptr,
-            input_stride,
-            (const sycl_t*)weight_ptr,
-            epsilon,
-            hidden_size,
-            s_variance));
-  });
+
+  bool use_slm = (static_cast<size_t>(hidden_size) * sizeof(float)) <=
+                 GEMMA_RMS_SLM_BUDGET_BYTES;
+
+  if (use_slm) {
+    queue.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> s_variance(sycl::range<1>(1), cgh);
+      sycl::local_accessor<float, 1> s_input(sycl::range<1>(hidden_size), cgh);
+      cgh.parallel_for(
+          sycl::nd_range<3>(grid * block, block),
+          gemma_rms_norm_kernel<sycl_t, /*VEC_SIZE=*/4, /*USE_SLM=*/true>(
+              (sycl_t*)out_ptr,
+              (const sycl_t*)input_ptr,
+              input_stride,
+              (const sycl_t*)weight_ptr,
+              epsilon,
+              hidden_size,
+              s_variance,
+              s_input));
+    });
+  } else {
+    queue.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> s_variance(sycl::range<1>(1), cgh);
+      // Pass a dummy size-1 accessor; the kernel will not touch it.
+      sycl::local_accessor<float, 1> s_input(sycl::range<1>(1), cgh);
+      cgh.parallel_for(
+          sycl::nd_range<3>(grid * block, block),
+          gemma_rms_norm_kernel<sycl_t, /*VEC_SIZE=*/4, /*USE_SLM=*/false>(
+              (sycl_t*)out_ptr,
+              (const sycl_t*)input_ptr,
+              input_stride,
+              (const sycl_t*)weight_ptr,
+              epsilon,
+              hidden_size,
+              s_variance,
+              s_input));
+    });
+  }
 }
 
 // Gemma variant of fused add + RMSNorm. In-place semantics:
@@ -480,7 +541,12 @@ void call_gemma_rms_norm_kernel(
 //   input    <- normalize(residual) * (1 + weight)   (in fp32, then cast)
 // Fast path uses vec4_t loads/stores when all four pointers and hidden_size
 // are VEC_SIZE-aligned; otherwise scalar fallback.
-template <typename scalar_t, int VEC_SIZE = 4>
+//
+// USE_SLM=true variant caches the fp32 `summed` values to shared local memory
+// during pass 1, so pass 2 reads from SLM instead of from HBM residual_row.
+// We still must store summed back to HBM residual_row (it's the externally
+// visible output), so this only saves the pass-2 HBM read, not the write.
+template <typename scalar_t, int VEC_SIZE = 4, bool USE_SLM = false>
 class gemma_fused_add_rms_norm_kernel {
  public:
   gemma_fused_add_rms_norm_kernel(
@@ -490,19 +556,23 @@ class gemma_fused_add_rms_norm_kernel {
       const scalar_t* __restrict__ weight_,  // [hidden_size]
       const float epsilon_,
       const int hidden_size_,
-      sycl::local_accessor<float, 1> s_variance_)
+      sycl::local_accessor<float, 1> s_variance_,
+      sycl::local_accessor<float, 1> s_summed_)
       : input(input_),
         residual(residual_),
         input_stride(input_stride_),
         weight(weight_),
         epsilon(epsilon_),
         hidden_size(hidden_size_),
-        s_variance(s_variance_) {}
+        s_variance(s_variance_),
+        s_summed(s_summed_) {}
 
   void operator() [[sycl::reqd_sub_group_size(32)]] (
       const sycl::nd_item<3>& item_ct1) const {
     float* s_variance_ptr =
         s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
+    float* s_summed_ptr =
+        s_summed.template get_multi_ptr<sycl::access::decorated::no>().get();
     float variance = 0.0f;
 
     const int row = item_ct1.get_group(2);
@@ -518,7 +588,7 @@ class gemma_fused_add_rms_norm_kernel {
                    ((addr_w & (WIDTH - 1)) == 0) &&
                    ((hidden_size & (VEC_SIZE - 1)) == 0);
 
-    // ---- pass 1: residual = input + residual; accumulate variance ----
+    // ---- pass 1: residual = input + residual; cache summed; accumulate variance ----
     if (can_vec) {
       auto* v_in = reinterpret_cast<vec4_t<scalar_t>*>(input_row);
       auto* v_res = reinterpret_cast<vec4_t<scalar_t>*>(residual_row);
@@ -534,6 +604,9 @@ class gemma_fused_add_rms_norm_kernel {
                      static_cast<float>(res_v.val[j]);
           variance += xs * xs;
           sum_v.val[j] = static_cast<scalar_t>(xs);
+          if constexpr (USE_SLM) {
+            s_summed_ptr[i * VEC_SIZE + j] = xs;
+          }
         }
         v_res[i] = sum_v;
       }
@@ -544,6 +617,9 @@ class gemma_fused_add_rms_norm_kernel {
                    static_cast<float>(residual_row[idx]);
         variance += xs * xs;
         residual_row[idx] = static_cast<scalar_t>(xs);
+        if constexpr (USE_SLM) {
+          s_summed_ptr[idx] = xs;
+        }
       }
     }
 
@@ -559,6 +635,9 @@ class gemma_fused_add_rms_norm_kernel {
     const float rrms = *s_variance_ptr;
 
     // ---- pass 2: input = norm(residual) * (1 + w) ----
+    // With USE_SLM=true we read summed from SLM and skip the HBM residual read.
+    // Note: summed in SLM is fp32 (more accurate than the cast-then-recast bf16
+    // round-trip in the no-SLM path). This is a strict improvement.
     if (can_vec) {
       auto const* v_res =
           reinterpret_cast<const vec4_t<scalar_t>*>(residual_row);
@@ -567,21 +646,35 @@ class gemma_fused_add_rms_norm_kernel {
       int64_t const num_vec = hidden_size / VEC_SIZE;
       for (int i = item_ct1.get_local_id(2); i < num_vec;
            i += item_ct1.get_local_range(2)) {
-        vec4_t<scalar_t> res_v = v_res[i];
         vec4_t<scalar_t> w_v = v_w[i];
         vec4_t<scalar_t> dst;
+        if constexpr (USE_SLM) {
 #pragma unroll
-        for (int j = 0; j < VEC_SIZE; ++j) {
-          float xs = static_cast<float>(res_v.val[j]);
-          float w = static_cast<float>(w_v.val[j]) + 1.0f;
-          dst.val[j] = static_cast<scalar_t>(xs * rrms * w);
+          for (int j = 0; j < VEC_SIZE; ++j) {
+            float xs = s_summed_ptr[i * VEC_SIZE + j];
+            float w = static_cast<float>(w_v.val[j]) + 1.0f;
+            dst.val[j] = static_cast<scalar_t>(xs * rrms * w);
+          }
+        } else {
+          vec4_t<scalar_t> res_v = v_res[i];
+#pragma unroll
+          for (int j = 0; j < VEC_SIZE; ++j) {
+            float xs = static_cast<float>(res_v.val[j]);
+            float w = static_cast<float>(w_v.val[j]) + 1.0f;
+            dst.val[j] = static_cast<scalar_t>(xs * rrms * w);
+          }
         }
         v_in[i] = dst;
       }
     } else {
       for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
            idx += item_ct1.get_local_range(2)) {
-        float xs = static_cast<float>(residual_row[idx]);
+        float xs;
+        if constexpr (USE_SLM) {
+          xs = s_summed_ptr[idx];
+        } else {
+          xs = static_cast<float>(residual_row[idx]);
+        }
         float w = static_cast<float>(weight[idx]) + 1.0f;
         input_row[idx] = static_cast<scalar_t>(xs * rrms * w);
       }
@@ -596,6 +689,7 @@ class gemma_fused_add_rms_norm_kernel {
   const float epsilon;
   const int hidden_size;
   sycl::local_accessor<float, 1> s_variance;
+  sycl::local_accessor<float, 1> s_summed;  // size 0 if USE_SLM=false
 };
 
 template <typename scalar_t>
@@ -614,19 +708,43 @@ void call_gemma_fused_add_rms_norm_kernel(
   sycl::range<3> grid(1, 1, num_tokens);
   sycl::range<3> block(1, 1, std::min(hidden_size, 1024));
   auto& queue = vllm::xpu::vllmGetQueue();
-  queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> s_variance(sycl::range<1>(1), cgh);
-    cgh.parallel_for(
-        sycl::nd_range<3>(grid * block, block),
-        gemma_fused_add_rms_norm_kernel<sycl_t>(
-            (sycl_t*)input_ptr,
-            (sycl_t*)residual_ptr,
-            input_stride,
-            (const sycl_t*)weight_ptr,
-            epsilon,
-            hidden_size,
-            s_variance));
-  });
+
+  bool use_slm = (static_cast<size_t>(hidden_size) * sizeof(float)) <=
+                 GEMMA_RMS_SLM_BUDGET_BYTES;
+
+  if (use_slm) {
+    queue.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> s_variance(sycl::range<1>(1), cgh);
+      sycl::local_accessor<float, 1> s_summed(sycl::range<1>(hidden_size), cgh);
+      cgh.parallel_for(
+          sycl::nd_range<3>(grid * block, block),
+          gemma_fused_add_rms_norm_kernel<sycl_t, /*VEC_SIZE=*/4, /*USE_SLM=*/true>(
+              (sycl_t*)input_ptr,
+              (sycl_t*)residual_ptr,
+              input_stride,
+              (const sycl_t*)weight_ptr,
+              epsilon,
+              hidden_size,
+              s_variance,
+              s_summed));
+    });
+  } else {
+    queue.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> s_variance(sycl::range<1>(1), cgh);
+      sycl::local_accessor<float, 1> s_summed(sycl::range<1>(1), cgh);
+      cgh.parallel_for(
+          sycl::nd_range<3>(grid * block, block),
+          gemma_fused_add_rms_norm_kernel<sycl_t, /*VEC_SIZE=*/4, /*USE_SLM=*/false>(
+              (sycl_t*)input_ptr,
+              (sycl_t*)residual_ptr,
+              input_stride,
+              (const sycl_t*)weight_ptr,
+              epsilon,
+              hidden_size,
+              s_variance,
+              s_summed));
+    });
+  }
 }
 
 }  // namespace vllm
