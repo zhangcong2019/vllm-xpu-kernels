@@ -325,6 +325,206 @@ void call_fused_add_rms_norm_kernel(
   });
 }
 
+// Gemma variant of RMSNorm.
+// Differences vs vllm::rms_norm_kernel:
+//   1. weight is loaded as (weight + 1.0) in fp32, applied to the normalized
+//      value still in fp32 (the (1 + w) factor is the Gemma convention).
+//   2. variance is accumulated in fp32 (already true upstream, kept here).
+template <typename scalar_t>
+class gemma_rms_norm_kernel {
+ public:
+  gemma_rms_norm_kernel(
+      scalar_t* __restrict__ out_,           // [..., hidden_size]
+      const scalar_t* __restrict__ input_,   // [..., hidden_size]
+      const int64_t input_stride_,
+      const scalar_t* __restrict__ weight_,  // [hidden_size]
+      const float epsilon_,
+      const int hidden_size_,
+      sycl::local_accessor<float, 1> s_variance_)
+      : out(out_),
+        input(input_),
+        input_stride(input_stride_),
+        weight(weight_),
+        epsilon(epsilon_),
+        hidden_size(hidden_size_),
+        s_variance(s_variance_) {}
+
+  void operator() [[sycl::reqd_sub_group_size(32)]] (
+      const sycl::nd_item<3>& item_ct1) const {
+    float* s_variance_ptr =
+        s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
+    float variance = 0.0f;
+
+    const int row = item_ct1.get_group(2);
+    const scalar_t* input_row = input + row * input_stride;
+    scalar_t* out_row = out + row * hidden_size;
+
+    for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
+         idx += item_ct1.get_local_range(2)) {
+      float x = static_cast<float>(input_row[idx]);
+      variance += x * x;
+    }
+
+    variance = sycl::reduce_over_group(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>(),
+        variance,
+        sycl::plus<>());
+    if (item_ct1.get_local_id(2) == 0) {
+      *s_variance_ptr = sycl::rsqrt(variance / hidden_size + epsilon);
+    }
+
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    const float rrms = *s_variance_ptr;
+
+    for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
+         idx += item_ct1.get_local_range(2)) {
+      float x = static_cast<float>(input_row[idx]);
+      float w = static_cast<float>(weight[idx]) + 1.0f;
+      out_row[idx] = static_cast<scalar_t>(x * rrms * w);
+    }
+  }
+
+ private:
+  scalar_t* __restrict__ out;
+  const scalar_t* __restrict__ input;
+  const int64_t input_stride;
+  const scalar_t* __restrict__ weight;
+  const float epsilon;
+  const int hidden_size;
+  sycl::local_accessor<float, 1> s_variance;
+};
+
+template <typename scalar_t>
+void call_gemma_rms_norm_kernel(
+    torch::Tensor& out,
+    torch::Tensor& input,
+    torch::Tensor& weight,
+    float epsilon) {
+  using sycl_t = typename vllm::xpu::SyclTypeTrait<scalar_t>::Type;
+  int hidden_size = input.size(-1);
+  int num_tokens = input.numel() / hidden_size;
+  int64_t input_stride = input.stride(-2);
+  auto out_ptr = out.data_ptr<scalar_t>();
+  auto input_ptr = input.data_ptr<scalar_t>();
+  auto weight_ptr = weight.data_ptr<scalar_t>();
+  sycl::range<3> grid(1, 1, num_tokens);
+  sycl::range<3> block(1, 1, std::min(hidden_size, 1024));
+  auto& queue = vllm::xpu::vllmGetQueue();
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> s_variance(sycl::range<1>(1), cgh);
+    cgh.parallel_for(
+        sycl::nd_range<3>(grid * block, block),
+        gemma_rms_norm_kernel<sycl_t>(
+            (sycl_t*)out_ptr,
+            (const sycl_t*)input_ptr,
+            input_stride,
+            (const sycl_t*)weight_ptr,
+            epsilon,
+            hidden_size,
+            s_variance));
+  });
+}
+
+// Gemma variant of fused add + RMSNorm. In-place semantics:
+//   residual <- input + residual   (the unnormalized sum)
+//   input    <- normalize(residual) * (1 + weight)   (in fp32, then cast)
+template <typename scalar_t>
+class gemma_fused_add_rms_norm_kernel {
+ public:
+  gemma_fused_add_rms_norm_kernel(
+      scalar_t* __restrict__ input_,         // [..., hidden_size]
+      scalar_t* __restrict__ residual_,      // [..., hidden_size]
+      const int64_t input_stride_,
+      const scalar_t* __restrict__ weight_,  // [hidden_size]
+      const float epsilon_,
+      const int hidden_size_,
+      sycl::local_accessor<float, 1> s_variance_)
+      : input(input_),
+        residual(residual_),
+        input_stride(input_stride_),
+        weight(weight_),
+        epsilon(epsilon_),
+        hidden_size(hidden_size_),
+        s_variance(s_variance_) {}
+
+  void operator() [[sycl::reqd_sub_group_size(32)]] (
+      const sycl::nd_item<3>& item_ct1) const {
+    float* s_variance_ptr =
+        s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
+    float variance = 0.0f;
+
+    const int row = item_ct1.get_group(2);
+    scalar_t* input_row = input + row * input_stride;
+    scalar_t* residual_row = residual + row * hidden_size;
+
+    for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
+         idx += item_ct1.get_local_range(2)) {
+      float xs = static_cast<float>(input_row[idx]) +
+                 static_cast<float>(residual_row[idx]);
+      variance += xs * xs;
+      residual_row[idx] = static_cast<scalar_t>(xs);
+    }
+
+    variance = sycl::reduce_over_group(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>(),
+        variance,
+        sycl::plus<>());
+    if (item_ct1.get_local_id(2) == 0) {
+      *s_variance_ptr = sycl::rsqrt(variance / hidden_size + epsilon);
+    }
+
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    const float rrms = *s_variance_ptr;
+
+    for (int idx = item_ct1.get_local_id(2); idx < hidden_size;
+         idx += item_ct1.get_local_range(2)) {
+      float xs = static_cast<float>(residual_row[idx]);
+      float w = static_cast<float>(weight[idx]) + 1.0f;
+      input_row[idx] = static_cast<scalar_t>(xs * rrms * w);
+    }
+  }
+
+ private:
+  scalar_t* __restrict__ input;
+  scalar_t* __restrict__ residual;
+  const int64_t input_stride;
+  const scalar_t* __restrict__ weight;
+  const float epsilon;
+  const int hidden_size;
+  sycl::local_accessor<float, 1> s_variance;
+};
+
+template <typename scalar_t>
+void call_gemma_fused_add_rms_norm_kernel(
+    torch::Tensor& input,
+    torch::Tensor& residual,
+    torch::Tensor& weight,
+    float epsilon) {
+  using sycl_t = typename vllm::xpu::SyclTypeTrait<scalar_t>::Type;
+  int hidden_size = input.size(-1);
+  int num_tokens = input.numel() / hidden_size;
+  int64_t input_stride = input.stride(-2);
+  auto input_ptr = input.data_ptr<scalar_t>();
+  auto residual_ptr = residual.data_ptr<scalar_t>();
+  auto weight_ptr = weight.data_ptr<scalar_t>();
+  sycl::range<3> grid(1, 1, num_tokens);
+  sycl::range<3> block(1, 1, std::min(hidden_size, 1024));
+  auto& queue = vllm::xpu::vllmGetQueue();
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> s_variance(sycl::range<1>(1), cgh);
+    cgh.parallel_for(
+        sycl::nd_range<3>(grid * block, block),
+        gemma_fused_add_rms_norm_kernel<sycl_t>(
+            (sycl_t*)input_ptr,
+            (sycl_t*)residual_ptr,
+            input_stride,
+            (const sycl_t*)weight_ptr,
+            epsilon,
+            hidden_size,
+            s_variance));
+  });
+}
+
 }  // namespace vllm
 
 void rms_norm(
@@ -357,6 +557,38 @@ void fused_add_rms_norm(
   VLLM_DISPATCH_FLOATING_TYPES(
       input.scalar_type(), "call_fused_add_rms_norm_kernel", [&] {
         vllm::call_fused_add_rms_norm_kernel<scalar_t>(
+            input, residual, weight, epsilon);
+      });
+}
+
+void gemma_rms_norm(
+    torch::Tensor& out,
+    torch::Tensor& input,
+    torch::Tensor& weight,
+    double epsilon) {
+  const at::DeviceGuard device_guard(input.device());
+  TORCH_CHECK(out.is_contiguous());
+  if (input.stride(-1) != 1) {
+    input = input.contiguous();
+  }
+  TORCH_CHECK(input.stride(-1) == 1);
+  TORCH_CHECK(weight.is_contiguous());
+  VLLM_DISPATCH_FLOATING_TYPES(
+      input.scalar_type(), "call_gemma_rms_norm_kernel", [&] {
+        vllm::call_gemma_rms_norm_kernel<scalar_t>(
+            out, input, weight, epsilon);
+      });
+}
+
+void gemma_fused_add_rms_norm(
+    torch::Tensor& input,
+    torch::Tensor& residual,
+    torch::Tensor& weight,
+    double epsilon) {
+  const at::DeviceGuard device_guard(input.device());
+  VLLM_DISPATCH_FLOATING_TYPES(
+      input.scalar_type(), "call_gemma_fused_add_rms_norm_kernel", [&] {
+        vllm::call_gemma_fused_add_rms_norm_kernel<scalar_t>(
             input, residual, weight, epsilon);
       });
 }
